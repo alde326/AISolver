@@ -1,10 +1,51 @@
 import requests
 import time
 import re
+from fuzzywuzzy import fuzz
+from fuzzywuzzy import process
 
 # Token de acceso
 TOKEN = "Bearer a31b6ff5-7941-4fbc-84d5-63f5c7146f3b"
 HEADERS = {"Authorization": TOKEN}
+
+# --- Obtener listas de nombres posibles ---
+def obtener_todos_los_nombres_pokemon():
+    url = "https://pokeapi.co/api/v2/pokemon?limit=10000"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return [p["name"] for p in response.json()["results"]]
+    return []
+
+def obtener_todos_los_personajes_swapi():
+    nombres = []
+    url = "https://swapi.py4e.com/api/people/"
+    while url:
+        response = requests.get(url)
+        if response.status_code != 200:
+            break
+        data = response.json()
+        nombres.extend([person["name"] for person in data["results"]])
+        url = data["next"]
+    return nombres
+
+def obtener_todos_los_planetas_swapi():
+    nombres = []
+    url = "https://swapi.py4e.com/api/planets/"
+    while url:
+        response = requests.get(url)
+        if response.status_code != 200:
+            break
+        data = response.json()
+        nombres.extend([planet["name"] for planet in data["results"]])
+        url = data["next"]
+    return nombres
+
+# --- Fuzzy Match ---
+def fuzzy_match(nombre, opciones):
+    mejor, score = process.extractOne(nombre, opciones)
+    if score > 80:
+        return mejor
+    return None
 
 # --- Obtener datos desde PokéAPI ---
 def fetch_pokemon_data(name):
@@ -13,13 +54,12 @@ def fetch_pokemon_data(name):
         response = requests.get(url)
         if response.status_code == 200:
             return response.json()
-    except Exception as e:
-        print(f"❌ Error al consultar PokéAPI ({name}):", e)
+    except:
+        pass
     return None
 
 # --- Obtener datos desde SWAPI ---
 def fetch_starwars_people(name):
-    # Reemplazamos swapi.dev por el mirror funcional swapi.py4e.com
     base_url = "https://swapi.py4e.com/api/people/?search="
     url = f"{base_url}{name.lower()}"
     try:
@@ -28,12 +68,11 @@ def fetch_starwars_people(name):
             results = response.json().get("results", [])
             if results:
                 return results[0]
-    except Exception as e:
-        print(f"❌ Error al consultar SWAPI ({name}):", e)
+    except:
+        pass
     return None
 
 def fetch_starwars_planets(name):
-    # Reemplazamos swapi.dev por el mirror funcional swapi.py4e.com
     base_url = "https://swapi.py4e.com/api/planets/?search="
     url = f"{base_url}{name.lower()}"
     try:
@@ -42,8 +81,8 @@ def fetch_starwars_planets(name):
             results = response.json().get("results", [])
             if results:
                 return results[0]
-    except Exception as e:
-        print(f"❌ Error al consultar SWAPI ({name}):", e)
+    except:
+        pass
     return None
 
 # --- IA: Convertir enunciado a fórmula ---
@@ -55,8 +94,15 @@ def interpretar_enunciado_con_ia(enunciado):
             {
                 "role": "developer",
                 "content": (
-                    "Convierte el enunciado en una fórmula matemática usando notación punto. "
-                    "Por ejemplo: luke.mass * vulpix.weight + horsea.weight / spinarak.height"
+                    "Convierte el siguiente enunciado en una fórmula matemática usando notación punto.\n"
+                    "- **Usa exactamente los mismos nombres de los personajes, Pokémon y planetas tal como aparecen en el enunciado original**, sin traducirlos, corregirlos, ni cambiarlos. Deben ir entre **comillas dobles** (\" \").\n"
+                    "- Usa la notación '\"nombre\".atributo', como '\"Luke Skywalker\".mass' o '\"Vulpix\".weight'.\n"
+                    "- Usa paréntesis para asegurar el orden correcto de operaciones.\n"
+                    "- Identifica solo las propiedades válidas de cada tipo:\n"
+                    "  • StarWarsPlanet: rotation_period, orbital_period, diameter, surface_water, population\n"
+                    "  • StarWarsCharacter: height, mass\n"
+                    "  • Pokemon: base_experience, height, weight\n"
+                    "- No expliques nada, no inventes nombres ni traduzcas.\n"
                 )
             },
             {"role": "user", "content": enunciado}
@@ -69,7 +115,7 @@ def interpretar_enunciado_con_ia(enunciado):
         print("❌ Error usando la IA:", response.text)
         return None
 
-# --- Clase normalizadora para evaluar fórmula ---
+# --- Clase normalizadora ---
 class Wrapper:
     def __init__(self, raw):
         for k, v in raw.items():
@@ -78,12 +124,16 @@ class Wrapper:
             except:
                 self.__dict__[k.lower()] = v
 
-# --- Detectar nombres de variables desde la fórmula ---
+# --- Extraer nombres desde fórmula ---
 def extraer_nombres_objetos(formula):
-    return list(set(re.findall(r'([a-zA-Z_]+)\.', formula)))
+    return list(set(re.findall(r'"([^"]+)"\.', formula)))
 
-# --- Resolver un solo problema ---
-def resolver_problema(problem):
+# --- Transformar fórmula para evaluación ---
+def transformar_formula(formula):
+    return re.sub(r'"([^"]+)"\.(\w+)', r'objects["\1"].\2', formula)
+
+# --- Resolver un problema ---
+def resolver_problema(problem, nombres_pokemon, nombres_starwars, nombres_planetas):
     problem_id = problem["id"]
     description = problem["problem"]
 
@@ -93,6 +143,7 @@ def resolver_problema(problem):
         return None, problem_id
 
     print(f"📐 Fórmula generada: {formula}")
+    print(f"📐 Fórmula esperada: {problem.get('expression', 'desconocida')}" )
 
     objetos = extraer_nombres_objetos(formula)
     print(f"🔍 Objetos detectados: {objetos}")
@@ -104,13 +155,32 @@ def resolver_problema(problem):
             datos = fetch_starwars_people(name)
         if not datos:
             datos = fetch_starwars_planets(name)
+
+        # Si aún no se encuentran, aplicar fuzzy matching
+        if not datos:
+            sugerencia = fuzzy_match(name, nombres_pokemon)
+            if sugerencia:
+                datos = fetch_pokemon_data(sugerencia)
+
+        if not datos:
+            sugerencia = fuzzy_match(name, nombres_starwars)
+            if sugerencia:
+                datos = fetch_starwars_people(sugerencia)
+
+        if not datos:
+            sugerencia = fuzzy_match(name, nombres_planetas)
+            if sugerencia:
+                datos = fetch_starwars_planets(sugerencia)
+
         if not datos:
             print(f"❌ No se pudo encontrar datos para: {name}")
             return None, problem_id
+
         data[name] = Wrapper(datos)
 
     try:
-        resultado = eval(formula, {}, data)
+        formula_transformada = transformar_formula(formula)
+        resultado = eval(formula_transformada, {"objects": data})
         resultado = round(resultado, 10)
         print(f"✅ Resultado: {resultado}")
         return resultado, problem_id
@@ -131,8 +201,15 @@ def correr_prueba(real=False):
     problem = response.json()
     tiempo_limite = time.time() + (180 if real else 9999)
 
+    # Precarga para fuzzy matching
+    print("🔃 Cargando listas para fuzzy matching...")
+    nombres_pokemon = obtener_todos_los_nombres_pokemon()
+    nombres_starwars = obtener_todos_los_personajes_swapi()
+    nombres_planetas = obtener_todos_los_planetas_swapi()
+    print("✅ Listas cargadas.")
+
     while time.time() < tiempo_limite:
-        resultado, problem_id = resolver_problema(problem)
+        resultado, problem_id = resolver_problema(problem, nombres_pokemon, nombres_starwars, nombres_planetas)
         if resultado is None:
             print("❌ No se pudo resolver el problema.")
             break
